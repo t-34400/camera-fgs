@@ -8,6 +8,10 @@ android {
     namespace = "com.t34400.camera_fgs"
     compileSdk = 35
 
+    lint {
+        disable += setOf("NullSafeMutableLiveData")
+    }
+
     defaultConfig {
         applicationId = "com.t34400.camera_fgs"
         minSdk = 29

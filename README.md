@@ -73,7 +73,6 @@ are provided in the **`unity-sample`** directory.
 
 These samples are intended for **simple visualization and experimentation**
 (e.g. receiving JPEG streams and displaying them on textures).
-Detailed usage instructions are intentionally omitted.
 
 ---
 

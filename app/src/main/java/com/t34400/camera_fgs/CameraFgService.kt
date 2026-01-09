@@ -6,7 +6,11 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.YuvImage
 import android.hardware.camera2.*
+import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -23,35 +27,51 @@ import java.io.ByteArrayOutputStream
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 /**
  * Foreground Service that opens BOTH passthrough RGB cameras (left/right) on Quest
- * and streams each as raw H.264 AnnexB over separate TCP ports.
+ * and exposes two independent streams per camera:
  *
- * PC side:
+ *  1) Raw H.264 (AnnexB) over TCP
+ *  2) JPEG frames over TCP (length-prefixed)
+ *
+ * Ports on the headset (loopback):
+ *   Left  H.264: 8081   Right H.264: 8082
+ *   Left  JPEG: 8091   Right JPEG: 8092
+ *
+ * PC side examples:
  *   adb forward tcp:18081 tcp:8081
  *   adb forward tcp:18082 tcp:8082
  *   ffplay -fflags nobuffer -flags low_delay -framedrop -analyzeduration 2000000 -probesize 2000000 -f h264 tcp://127.0.0.1:18081
- *   ffplay -fflags nobuffer -flags low_delay -framedrop -analyzeduration 2000000 -probesize 2000000 -f h264 tcp://127.0.0.1:18082
+ *
+ * JPEG stream is for quick/debug visualization (e.g., Unity C# can LoadImage on each frame):
+ *   adb forward tcp:19091 tcp:8091
+ *   adb forward tcp:19092 tcp:8092
  */
 class CameraFgService : Service() {
 
-    private val tag = "DualCameraFgService"
+    private val tag = "DualCamFgSvc"
     private val channelId = "camera_fgs"
-    private val notifId = 2
+    private val notifId = 3
 
-    // Device-side ports (loopback). Expose via adb forward.
-    private val leftPort = 8081
-    private val rightPort = 8082
+    private val leftH264Port = 8081
+    private val rightH264Port = 8082
+    private val leftJpegPort = 8091
+    private val rightJpegPort = 8092
 
-    // Fixed start; can be made dynamic by reading StreamConfigurationMap per camera.
+    // Start fixed; can be made dynamic per camera.
     private val width = 1280
     private val height = 960
     private val fps = 30
     private val iFrameIntervalSec = 1
     private val bitrate = 4_000_000
+
+    // JPEG is intentionally throttled to reduce CPU/USB load.
+    private val jpegMaxFps = 10
+    private val jpegQuality = 80
 
     private lateinit var cameraManager: CameraManager
 
@@ -84,23 +104,27 @@ class CameraFgService : Service() {
 
         Log.i(tag, "Selected cameraIds left=$leftId right=$rightId all=${ids.joinToString()}")
 
-        val handler = bgHandler
-        if (handler == null) {
+        val handler = bgHandler ?: run {
             Log.e(tag, "bgHandler is null")
             return START_NOT_STICKY
         }
 
+        leftPipeline?.stop()
+        rightPipeline?.stop()
+
         if (leftId != null) {
-            leftPipeline?.stop()
             leftPipeline = CameraPipeline(
                 label = "left",
                 cameraId = leftId,
-                listenPort = leftPort,
+                h264Port = leftH264Port,
+                jpegPort = leftJpegPort,
                 width = width,
                 height = height,
                 fps = fps,
                 iFrameIntervalSec = iFrameIntervalSec,
                 bitrate = bitrate,
+                jpegMaxFps = jpegMaxFps,
+                jpegQuality = jpegQuality,
                 cameraManager = cameraManager,
                 handler = handler
             ).also { it.start() }
@@ -109,16 +133,18 @@ class CameraFgService : Service() {
         }
 
         if (rightId != null) {
-            rightPipeline?.stop()
             rightPipeline = CameraPipeline(
                 label = "right",
                 cameraId = rightId,
-                listenPort = rightPort,
+                h264Port = rightH264Port,
+                jpegPort = rightJpegPort,
                 width = width,
                 height = height,
                 fps = fps,
                 iFrameIntervalSec = iFrameIntervalSec,
                 bitrate = bitrate,
+                jpegMaxFps = jpegMaxFps,
+                jpegQuality = jpegQuality,
                 cameraManager = cameraManager,
                 handler = handler
             ).also { it.start() }
@@ -139,11 +165,6 @@ class CameraFgService : Service() {
         super.onDestroy()
     }
 
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        Log.w(tag, "onTaskRemoved")
-        super.onTaskRemoved(rootIntent)
-    }
-
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun startInForeground() {
@@ -160,7 +181,7 @@ class CameraFgService : Service() {
 
         val notification: Notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("Dual camera streaming")
-            .setContentText("Left:$leftPort Right:$rightPort (adb forward)")
+            .setContentText("H264 L:$leftH264Port R:$rightH264Port | JPEG L:$leftJpegPort R:$rightJpegPort")
             .setSmallIcon(android.R.drawable.presence_video_online)
             .setOngoing(true)
             .build()
@@ -185,7 +206,6 @@ class CameraFgService : Service() {
     }
 
     private fun selectPassthroughCameraId(ids: List<String>, position: Int): String? {
-        // Primary: Meta vendor tags
         ids.firstOrNull { id ->
             try {
                 val ch = cameraManager.getCameraCharacteristics(id)
@@ -197,7 +217,6 @@ class CameraFgService : Service() {
             }
         }?.let { return it }
 
-        // Fallback: still pick any camera_source==0
         ids.firstOrNull { id ->
             try {
                 val ch = cameraManager.getCameraCharacteristics(id)
@@ -223,18 +242,20 @@ class CameraFgService : Service() {
 private class CameraPipeline(
     private val label: String,
     private val cameraId: String,
-    private val listenPort: Int,
+    private val h264Port: Int,
+    private val jpegPort: Int,
     private val width: Int,
     private val height: Int,
     private val fps: Int,
     private val iFrameIntervalSec: Int,
     private val bitrate: Int,
+    private val jpegMaxFps: Int,
+    private val jpegQuality: Int,
     private val cameraManager: CameraManager,
     private val handler: Handler,
 ) {
 
-    private val tag = "CamPipe-$label"
-
+    private val tag = "Pipe-$label"
     private val running = AtomicBoolean(false)
 
     private var cameraDevice: CameraDevice? = null
@@ -243,86 +264,141 @@ private class CameraPipeline(
     private var codec: MediaCodec? = null
     private var codecInputSurface: Surface? = null
 
-    private var serverSocket: ServerSocket? = null
-    private var clientSocket: Socket? = null
-    private var clientOut: BufferedOutputStream? = null
+    private var jpegReader: ImageReader? = null
 
-    private var serverThread: Thread? = null
+    // H.264 TCP server
+    private var h264ServerSocket: ServerSocket? = null
+    private var h264ClientSocket: Socket? = null
+    private var h264Out: BufferedOutputStream? = null
+    private var h264ServerThread: Thread? = null
     private var drainThread: Thread? = null
+
+    // JPEG TCP server (length-prefixed frames)
+    private var jpegServerSocket: ServerSocket? = null
+    private var jpegClientSocket: Socket? = null
+    private var jpegOut: BufferedOutputStream? = null
+    private var jpegServerThread: Thread? = null
 
     private val configLock = Any()
     @Volatile private var spsPpsAnnexB: ByteArray? = null
 
+    @Volatile private var lastJpegSendNs: Long = 0
+
     fun start() {
         if (!running.compareAndSet(false, true)) return
-        startTcpServer()
+        startH264Server()
+        startJpegServer()
         openCamera()
     }
 
     fun stop() {
         if (!running.compareAndSet(true, false)) return
         stopStreaming()
-        stopTcpServer()
+        stopH264Server()
+        stopJpegServer()
     }
 
-    private fun startTcpServer() {
-        serverThread = thread(name = "server-$label", isDaemon = true) {
+    private fun startH264Server() {
+        h264ServerThread = thread(name = "h264-server-$label", isDaemon = true) {
             try {
-                serverSocket = ServerSocket(listenPort, 1)
-                Log.i(tag, "TCP server listening on 127.0.0.1:$listenPort")
-
+                h264ServerSocket = ServerSocket(h264Port, 1)
+                Log.i(tag, "H.264 server on 127.0.0.1:$h264Port")
                 while (running.get() && !Thread.currentThread().isInterrupted) {
-                    val s = serverSocket?.accept() ?: break
+                    val s = h264ServerSocket?.accept() ?: break
                     synchronized(this) {
-                        clientOut?.flush()
-                        clientOut?.close()
-                        clientSocket?.close()
-                        clientSocket = s
-                        clientOut = BufferedOutputStream(s.getOutputStream())
+                        h264Out?.flush()
+                        h264Out?.close()
+                        h264ClientSocket?.close()
+                        h264ClientSocket = s
+                        h264Out = BufferedOutputStream(s.getOutputStream())
                     }
-                    Log.i(tag, "Client connected: ${s.inetAddress}:${s.port}")
+                    Log.i(tag, "H.264 client connected: ${s.inetAddress}:${s.port}")
 
                     val cfg = synchronized(configLock) { spsPpsAnnexB }
                     if (cfg != null) {
                         try {
-                            synchronized(this) { clientOut }?.apply {
+                            synchronized(this) { h264Out }?.apply {
                                 write(cfg)
                                 flush()
                             }
-                            Log.i(tag, "Sent cached SPS/PPS (${cfg.size} bytes)")
+                            Log.i(tag, "H.264: sent cached SPS/PPS (${cfg.size} bytes)")
                         } catch (e: Exception) {
-                            Log.w(tag, "Failed to send cached SPS/PPS", e)
+                            Log.w(tag, "H.264: failed to send cached SPS/PPS", e)
                         }
                     }
 
                     requestSyncFrame()
                 }
             } catch (e: Exception) {
-                if (running.get()) Log.e(tag, "TCP server error", e)
+                if (running.get()) Log.e(tag, "H.264 server error", e)
             }
         }
     }
 
-    private fun stopTcpServer() {
+    private fun stopH264Server() {
         try {
             synchronized(this) {
-                clientOut?.flush()
-                clientOut?.close()
-                clientSocket?.close()
-                clientOut = null
-                clientSocket = null
+                h264Out?.flush()
+                h264Out?.close()
+                h264ClientSocket?.close()
+                h264Out = null
+                h264ClientSocket = null
             }
         } catch (_: Exception) {
         }
 
         try {
-            serverSocket?.close()
-            serverSocket = null
+            h264ServerSocket?.close()
+            h264ServerSocket = null
         } catch (_: Exception) {
         }
 
-        serverThread?.interrupt()
-        serverThread = null
+        h264ServerThread?.interrupt()
+        h264ServerThread = null
+    }
+
+    private fun startJpegServer() {
+        jpegServerThread = thread(name = "jpeg-server-$label", isDaemon = true) {
+            try {
+                jpegServerSocket = ServerSocket(jpegPort, 1)
+                Log.i(tag, "JPEG server on 127.0.0.1:$jpegPort")
+                while (running.get() && !Thread.currentThread().isInterrupted) {
+                    val s = jpegServerSocket?.accept() ?: break
+                    synchronized(this) {
+                        jpegOut?.flush()
+                        jpegOut?.close()
+                        jpegClientSocket?.close()
+                        jpegClientSocket = s
+                        jpegOut = BufferedOutputStream(s.getOutputStream())
+                    }
+                    Log.i(tag, "JPEG client connected: ${s.inetAddress}:${s.port}")
+                }
+            } catch (e: Exception) {
+                if (running.get()) Log.e(tag, "JPEG server error", e)
+            }
+        }
+    }
+
+    private fun stopJpegServer() {
+        try {
+            synchronized(this) {
+                jpegOut?.flush()
+                jpegOut?.close()
+                jpegClientSocket?.close()
+                jpegOut = null
+                jpegClientSocket = null
+            }
+        } catch (_: Exception) {
+        }
+
+        try {
+            jpegServerSocket?.close()
+            jpegServerSocket = null
+        } catch (_: Exception) {
+        }
+
+        jpegServerThread?.interrupt()
+        jpegServerThread = null
     }
 
     private fun openCamera() {
@@ -373,31 +449,45 @@ private class CameraPipeline(
             codec = c
             codecInputSurface = inputSurface
 
+            jpegReader = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, 2).apply {
+                setOnImageAvailableListener({ reader ->
+                    val img = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                    try {
+                        handleJpegFrame(img)
+                    } catch (e: Exception) {
+                        Log.w(tag, "JPEG encode failed", e)
+                    } finally {
+                        img.close()
+                    }
+                }, handler)
+            }
+
             drainThread = thread(name = "drain-$label", isDaemon = true) { drainEncoderLoop() }
 
-            createCaptureSession(device, inputSurface)
-            Log.i(tag, "Encoder started: ${width}x$height ${fps}fps bitrate=$bitrate")
+            createCaptureSession(device, inputSurface, jpegReader!!.surface)
+            Log.i(tag, "Encoder started: ${width}x$height ${fps}fps bitrate=$bitrate | JPEG max ${jpegMaxFps}fps")
         } catch (e: Exception) {
             Log.e(tag, "Failed to start codec/session", e)
             stop()
         }
     }
 
-    private fun createCaptureSession(device: CameraDevice, targetSurface: Surface) {
+    private fun createCaptureSession(device: CameraDevice, h264Surface: Surface, jpegSurface: Surface) {
         try {
             device.createCaptureSession(
-                listOf(targetSurface),
+                listOf(h264Surface, jpegSurface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
                         Log.i(tag, "CaptureSession onConfigured")
                         captureSession = session
                         try {
                             val req = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                                addTarget(targetSurface)
+                                addTarget(h264Surface)
+                                addTarget(jpegSurface)
                                 set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
                             }
                             session.setRepeatingRequest(req.build(), null, handler)
-                            Log.i(tag, "setRepeatingRequest started (codec surface)")
+                            Log.i(tag, "setRepeatingRequest started")
                         } catch (e: Exception) {
                             Log.e(tag, "setRepeatingRequest error", e)
                         }
@@ -434,17 +524,14 @@ private class CameraPipeline(
                             val cfg = buildSpsPpsAnnexB(csd0, csd1)
                             synchronized(configLock) { spsPpsAnnexB = cfg }
 
-                            val out = synchronized(this) { clientOut }
+                            val out = synchronized(this) { h264Out }
                             if (out != null) {
                                 try {
                                     out.write(cfg)
                                     out.flush()
-                                    Log.i(tag, "Sent SPS/PPS to client (format changed)")
                                 } catch (e: Exception) {
-                                    Log.w(tag, "Failed to send SPS/PPS to client", e)
+                                    Log.w(tag, "H.264: failed to send SPS/PPS", e)
                                 }
-                            } else {
-                                Log.i(tag, "Cached SPS/PPS (no client yet)")
                             }
                         }
                     }
@@ -454,7 +541,7 @@ private class CameraPipeline(
                         if (outBuf != null && info.size > 0) {
                             outBuf.position(info.offset)
                             outBuf.limit(info.offset + info.size)
-                            writeSampleAuto(outBuf.slice())
+                            writeH264SampleAuto(outBuf.slice())
                         }
                         c.releaseOutputBuffer(outIndex, false)
                     }
@@ -498,13 +585,12 @@ private class CameraPipeline(
                 putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
             }
             c.setParameters(b)
-            Log.i(tag, "Requested sync frame")
         } catch (_: Exception) {
         }
     }
 
-    private fun writeSampleAuto(sample: ByteBuffer) {
-        val out = synchronized(this) { clientOut } ?: return
+    private fun writeH264SampleAuto(sample: ByteBuffer) {
+        val out = synchronized(this) { h264Out } ?: return
 
         fun looksLikeAnnexB(buf: ByteBuffer): Boolean {
             if (buf.remaining() < 4) return false
@@ -537,12 +623,111 @@ private class CameraPipeline(
             }
             out.flush()
         } catch (e: Exception) {
-            Log.w(tag, "Client write failed (disconnect?)", e)
+            Log.w(tag, "H.264 write failed (disconnect?)", e)
             synchronized(this) {
-                try { clientOut?.close() } catch (_: Exception) {}
-                try { clientSocket?.close() } catch (_: Exception) {}
-                clientOut = null
-                clientSocket = null
+                try { h264Out?.close() } catch (_: Exception) {}
+                try { h264ClientSocket?.close() } catch (_: Exception) {}
+                h264Out = null
+                h264ClientSocket = null
+            }
+        }
+    }
+
+    private fun handleJpegFrame(img: android.media.Image) {
+        val now = System.nanoTime()
+        val minIntervalNs = 1_000_000_000L / jpegMaxFps.coerceAtLeast(1)
+        if (now - lastJpegSendNs < minIntervalNs) return
+        lastJpegSendNs = now
+
+        val out = synchronized(this) { jpegOut } ?: return
+        val jpegBytes = yuv420ToJpeg(img, jpegQuality)
+
+        try {
+            // 4-byte big-endian length prefix + JPEG bytes
+            val lenBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(jpegBytes.size)
+            out.write(lenBuf.array())
+            out.write(jpegBytes)
+            out.flush()
+        } catch (e: Exception) {
+            Log.w(tag, "JPEG write failed (disconnect?)", e)
+            synchronized(this) {
+                try { jpegOut?.close() } catch (_: Exception) {}
+                try { jpegClientSocket?.close() } catch (_: Exception) {}
+                jpegOut = null
+                jpegClientSocket = null
+            }
+        }
+    }
+
+    private fun yuv420ToJpeg(img: android.media.Image, quality: Int): ByteArray {
+        val nv21 = yuv420888ToNv21(img)
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, img.width, img.height, null)
+        val baos = ByteArrayOutputStream()
+        yuvImage.compressToJpeg(Rect(0, 0, img.width, img.height), quality.coerceIn(1, 100), baos)
+        return baos.toByteArray()
+    }
+
+    private fun yuv420888ToNv21(img: android.media.Image): ByteArray {
+        val w = img.width
+        val h = img.height
+        val ySize = w * h
+        val uvSize = w * h / 2
+        val out = ByteArray(ySize + uvSize)
+
+        val yPlane = img.planes[0]
+        val uPlane = img.planes[1]
+        val vPlane = img.planes[2]
+
+        // Y
+        copyPlane(yPlane.buffer, yPlane.rowStride, yPlane.pixelStride, w, h, out, 0, 1)
+
+        // UV interleaved as VU (NV21)
+        val chromaHeight = h / 2
+        val chromaWidth = w / 2
+
+        val uBuf = uPlane.buffer
+        val vBuf = vPlane.buffer
+        val uRowStride = uPlane.rowStride
+        val vRowStride = vPlane.rowStride
+        val uPixelStride = uPlane.pixelStride
+        val vPixelStride = vPlane.pixelStride
+
+        var outPos = ySize
+        for (row in 0 until chromaHeight) {
+            var uRowStart = row * uRowStride
+            var vRowStart = row * vRowStride
+            for (col in 0 until chromaWidth) {
+                val uIndex = uRowStart + col * uPixelStride
+                val vIndex = vRowStart + col * vPixelStride
+                out[outPos++] = vBuf.get(vIndex)
+                out[outPos++] = uBuf.get(uIndex)
+            }
+        }
+
+        return out
+    }
+
+    private fun copyPlane(
+        buffer: ByteBuffer,
+        rowStride: Int,
+        pixelStride: Int,
+        width: Int,
+        height: Int,
+        out: ByteArray,
+        outOffset: Int,
+        outPixelStride: Int
+    ) {
+        val dup = buffer.duplicate()
+        var outPos = outOffset
+        val row = ByteArray(rowStride)
+        for (r in 0 until height) {
+            dup.position(r * rowStride)
+            dup.get(row, 0, minOf(rowStride, dup.remaining()))
+            var inPos = 0
+            for (c in 0 until width) {
+                out[outPos] = row[inPos]
+                outPos += outPixelStride
+                inPos += pixelStride
             }
         }
     }
@@ -553,6 +738,9 @@ private class CameraPipeline(
 
         try { cameraDevice?.close() } catch (_: Exception) {}
         cameraDevice = null
+
+        try { jpegReader?.close() } catch (_: Exception) {}
+        jpegReader = null
 
         drainThread?.interrupt()
         drainThread = null

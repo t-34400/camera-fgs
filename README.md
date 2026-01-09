@@ -32,6 +32,13 @@ Passthrough Camera API is **not supported over Quest Link**.
 
 ---
 
+## YouTube
+<div align="left">
+  <a href="https://www.youtube.com/watch?v=Nc9uimZZRM4"><img src="https://img.youtube.com/vi/Nc9uimZZRM4/0.jpg" alt="IMAGE ALT TEXT"></a>
+</div>
+
+---
+
 ## Usage
 
 ### 1. Install from release
